@@ -552,3 +552,60 @@ class TestWeeklyEnrichment(unittest.TestCase):
     def test_plan_says_nothing_to_do_when_healthy(self):
         out = "\n".join(wr.build_next_week_plan(7, {"calm": 150, "groove": 150}, {"summary": {}}, None, 500))
         self.assertIn("손댈 것이 없습니다", out)
+
+
+class TestWeekBounds(unittest.TestCase):
+    """리포트 구간은 지난 월요일 00:00 ~ 일요일 24:00 (사장님 지시).
+
+    구간 끝을 '리포트가 도는 시각'으로 두면 월요일 새벽 몇 시간이 지난주
+    리포트에 섞인다. 실제로 2026-09-07 리포트 헤더가 '08/31 ~ 09/07'로 찍혀
+    당일치가 포함된 것처럼 보였다.
+    """
+
+    def test_monday_run_covers_last_monday_through_sunday(self):
+        start, end = wr.week_bounds(datetime(2026, 9, 7, 9, 9, tzinfo=KST))
+        self.assertEqual(start, datetime(2026, 8, 31, 0, 0, tzinfo=KST))
+        self.assertEqual(end, datetime(2026, 9, 7, 0, 0, tzinfo=KST))
+
+    def test_late_run_reports_the_same_week(self):
+        # 화요일로 밀려 돌아도 결산 대상은 같은 주다 (따라잡기 없음).
+        start, end = wr.week_bounds(datetime(2026, 9, 8, 10, 0, tzinfo=KST))
+        self.assertEqual(start, datetime(2026, 8, 31, 0, 0, tzinfo=KST))
+        self.assertEqual(end, datetime(2026, 9, 7, 0, 0, tzinfo=KST))
+
+    def test_skipped_week_extends_backwards(self):
+        # 한 주를 통째로 걸러뛰면 그 사이 영상이 어느 리포트에도 안 실린다.
+        prev = datetime(2026, 8, 24, 9, 0, tzinfo=KST)
+        start, end = wr.week_bounds(datetime(2026, 9, 7, 9, 0, tzinfo=KST), prev)
+        self.assertEqual(start, prev)
+        self.assertEqual(end, datetime(2026, 9, 7, 0, 0, tzinfo=KST))
+
+    def test_header_and_new_videos_exclude_report_day(self):
+        now = datetime(2026, 9, 7, 9, 9, tzinfo=KST)  # 월요일 아침
+        week_start, week_end = wr.week_bounds(now)
+
+        def iso(dt):
+            return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        videos = {
+            "sun": {  # 일요일 영상 - 포함되어야 한다
+                "title": "일요일 영상", "description": "#공부플리 #조선로파이 #lofi\n본문",
+                "publishedAt": iso(datetime(2026, 9, 6, 19, 14, tzinfo=KST)),
+                "privacyStatus": "public", "viewCount": 5, "likeCount": 0, "commentCount": 0,
+            },
+            "mon": {  # 리포트 당일 새벽 영상 - 이번 주가 아니라 다음 주 것이다
+                "title": "월요일 새벽 영상", "description": "#공부플리 #조선로파이 #lofi\n본문",
+                "publishedAt": iso(datetime(2026, 9, 7, 2, 40, tzinfo=KST)),
+                "privacyStatus": "public", "viewCount": 1, "likeCount": 0, "commentCount": 0,
+            },
+        }
+        report = wr.build_report(
+            now, {"subscriberCount": 5, "viewCount": 100, "videoCount": 2},
+            {"subscriberCount": 4, "viewCount": 90}, videos, {}, {},
+            wr.build_genre_lookup(make_templates()),
+            week_start=week_start, week_end=week_end,
+        )
+        self.assertIn("(08/31 ~ 09/06)", report)
+        self.assertNotIn("09/07", report.split("[이번 주 신작")[1].split("[")[0])
+        self.assertIn("일요일 영상", report)
+        self.assertIn("[이번 주 신작 (1개)]", report)

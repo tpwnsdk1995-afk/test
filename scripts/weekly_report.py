@@ -586,6 +586,23 @@ def build_recommendations(channel_stats, channel_prev, total_delta, genre_groups
     return lines
 
 
+def week_bounds(now, prev_snapshot_at=None):
+    """리포트가 다루는 구간: 지난 월요일 00:00 ~ 이번 월요일 00:00 (KST, 끝은 배타적).
+
+    월요일 아침에 돌면 '지난주 월~일' 전체가 그대로 들어간다. 화요일에 늦게
+    돌아도 대상은 같은 주다 (따라잡기 없이 그 주를 결산한다).
+
+    한도초과 등으로 한 주를 통째로 걸러뛴 경우에는 시작을 직전 리포트 시점까지
+    앞당긴다 — 그 사이 올라간 영상이 어느 리포트에도 안 실리는 구멍을 막는다.
+    """
+    week_end = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    week_start = week_end - timedelta(days=7)
+    if prev_snapshot_at is not None and prev_snapshot_at < week_start:
+        week_start = prev_snapshot_at
+    return week_start, week_end
+
+
 def should_append_history(history, now, min_days=6):
     """추세 기록은 주 1회만 남긴다. 진단 목적의 수동 재실행이 같은 주에 여러 항목을
     쌓으면 '몇 주째 정체' 판단이 망가지기 때문이다."""
@@ -717,18 +734,22 @@ def build_next_week_plan(new_video_count, library_counts, analytics, analytics_e
 
 def build_report(now, channel_stats, channel_prev, videos, video_prev, recent_by_id, genre_lookup,
                  library_counts=None, history=None, analytics=None, prev_analytics_summary=None,
-                 analytics_error=None, week_start=None):
-    # 집계 구간은 "직전 리포트(스냅샷) 시점 ~ 지금"이다. 증가분이 스냅샷 차이로
-    # 계산되므로 이 구간이 실제 측정 구간이고, 리포트가 한 주 걸러뛴 경우에도
-    # (한도초과 등) 그 사이의 신작·데이터가 빠짐없이 다음 리포트에 들어간다.
-    # 사장님 기준: 리포트 사이에 누락되는 데이터가 있어서는 안 된다.
+                 analytics_error=None, week_start=None, week_end=None, snapshot_at=None):
+    # 리포트가 다루는 구간은 지난 월요일 00:00 ~ 일요일 24:00 (KST)이다.
+    # 사장님 기준: "월~일 한 주를 다음 월요일에 보고한다." 그래서 구간 끝을
+    # '리포트가 도는 시각'이 아니라 '이번 월요일 00:00'으로 못박는다 — 그러지
+    # 않으면 월요일 새벽 몇 시간이 지난주 리포트에 섞여 들어간다.
+    if week_end is None:
+        week_end = now
     if week_start is None:
-        week_start = now - timedelta(days=7)
+        week_start = week_end - timedelta(days=7)
     # "업로드 N/M편"의 분모도 실제 구간 길이에 맞춘다 (2주치 리포트에 /7편이라고
     # 쓰면 14편이 초과 달성처럼 보인다).
-    expected_uploads = max(1, round((now - week_start).total_seconds() / 86400))
+    expected_uploads = max(1, round((week_end - week_start).total_seconds() / 86400))
+    # 표시는 포함 구간의 마지막 날(일요일)까지. week_end는 배타적 경계다.
+    last_day = week_end - timedelta(seconds=1)
     lines = []
-    lines.append(f"📊 조선로파이 주간 리포트 ({week_start.strftime('%m/%d')} ~ {now.strftime('%m/%d')})")
+    lines.append(f"📊 조선로파이 주간 리포트 ({week_start.strftime('%m/%d')} ~ {last_day.strftime('%m/%d')})")
     lines.append("")
 
     sub_delta = None
@@ -748,6 +769,10 @@ def build_report(now, channel_stats, channel_prev, videos, video_prev, recent_by
         view_text += f" ({fmt_delta(view_delta)})"
     lines.append(f"총 조회수: {view_text}")
     lines.append(f"공개 영상 수: {channel_stats['videoCount']}개")
+    if channel_prev and snapshot_at:
+        # 유튜브 API는 '현재까지 누적'만 주므로 증감은 스냅샷 사이로만 잴 수 있다.
+        # 구간(월~일)과 미세하게 어긋날 수 있어 기준 시각을 밝힌다.
+        lines.append(f"※ 증감은 지난 리포트 시점({snapshot_at.strftime('%m/%d %H:%M')}) 대비입니다.")
     lines.append("")
 
     if analytics:
@@ -779,7 +804,7 @@ def build_report(now, channel_stats, channel_prev, videos, video_prev, recent_by
     new_videos = []
     for vid, v in public_videos.items():
         published = datetime.fromisoformat(v["publishedAt"].replace("Z", "+00:00")).astimezone(KST)
-        if published >= week_start:
+        if week_start <= published < week_end:
             new_videos.append((vid, v, published))
     new_videos.sort(key=lambda t: t[2], reverse=True)
 
@@ -942,22 +967,20 @@ def main():
     analytics, analytics_error = youtube_analytics.safe_fetch(credentials, now)
     prev_analytics_summary = (prev_snapshot.get("analytics") or {}).get("summary")
 
-    # 집계 구간의 시작 = 직전 스냅샷 시점. 리포트가 한 주 걸러뛰어도 그 사이
-    # 신작·데이터가 빠짐없이 이번 리포트에 들어가게 한다 (없으면 7일 전으로 폴백).
-    week_start = None
-    prev_at = prev_snapshot.get("snapshot_at")
-    if prev_at:
+    prev_at = None
+    raw_prev_at = prev_snapshot.get("snapshot_at")
+    if raw_prev_at:
         try:
-            week_start = datetime.fromisoformat(prev_at)
+            prev_at = datetime.fromisoformat(raw_prev_at)
         except ValueError:
-            week_start = None
-    if week_start is None or week_start >= now:
-        week_start = now - timedelta(days=7)
+            prev_at = None
+    week_start, week_end = week_bounds(now, prev_at)
 
     report = build_report(now, channel_stats, channel_prev, videos, video_prev, recent_by_id,
                           genre_lookup, library_counts=library_counts, history=history,
                           analytics=analytics, prev_analytics_summary=prev_analytics_summary,
-                          analytics_error=analytics_error, week_start=week_start)
+                          analytics_error=analytics_error, week_start=week_start,
+                          week_end=week_end, snapshot_at=prev_at)
 
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(report)
